@@ -1,76 +1,160 @@
-import sys
+import discord
+from discord.ext import commands, tasks
+import asyncio
+import datetime
+import pytz
+import random
+import json
+from youtube_dl import YoutubeDL
 
-# Constants for 6502
-MEMORY_SIZE = 0x10000  # 64KB memory
+intents = discord.Intents.default()
+intents.members = True  # Required for welcoming new members
+client = commands.Bot(command_prefix="!", intents=intents)
 
-# Registers for 6502
-class CPU:
-    def __init__(self):
-        self.pc = 0x0000  # Program Counter
-        self.sp = 0xFF    # Stack Pointer
-        self.a = 0        # Accumulator
-        self.x = 0        # X Register
-        self.y = 0        # Y Register
-        self.status = 0   # Status Register (Processor Status)
-        self.memory = [0] * MEMORY_SIZE  # Memory Array
+# Data structures for reminders and polls
+reminders = []
+polls = {}
 
-    def reset(self):
-        self.pc = 0x0600  # Example reset address
-        self.sp = 0xFF
-        self.a = 0
-        self.x = 0
-        self.y = 0
-        self.status = 0x00  # Set the status flags to zero
+# Music-related variables
+music_queue = []
+is_playing = False
 
-    def load_program(self, program: bytes, start_address: int = 0x0600):
-        for i, byte in enumerate(program):
-            self.memory[start_address + i] = byte
-        self.pc = start_address
+# Function to get current time in UTC
+def get_utc_time():
+    return datetime.datetime.now(pytz.utc)
 
-    def fetch(self):
-        # Fetch the next byte from memory (opcode)
-        return self.memory[self.pc]
+# --- Helper Functions ---
+def check_time_format(time_str):
+    try:
+        # Try to parse the time in a specific format
+        return datetime.datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return None
 
-    def execute(self):
-        opcode = self.fetch()
-        self.pc += 1
-        if opcode == 0xA9:  # LDA Immediate (Load Accumulator)
-            self.lda_immediate()
-        elif opcode == 0xA2:  # LDX Immediate (Load X Register)
-            self.ldx_immediate()
-        # Add other opcodes here...
+# --- Reminder Functions ---
+@tasks.loop(seconds=60)
+async def check_reminders():
+    now = get_utc_time()
+    for reminder in reminders[:]:
+        if reminder['time'] <= now:
+            user = client.get_user(reminder['user_id'])
+            await user.send(f"Reminder: {reminder['message']}")
+            reminders.remove(reminder)
 
-    def lda_immediate(self):
-        # LDA #value - Load the Accumulator with an immediate value
-        self.a = self.memory[self.pc]
-        self.pc += 1
+@client.command()
+async def setreminder(ctx, time: str, *, message: str):
+    reminder_time = check_time_format(time)
+    if not reminder_time:
+        await ctx.send("Invalid time format. Please use the format YYYY-MM-DD HH:MM:SS.")
+        return
 
-    def ldx_immediate(self):
-        # LDX #value - Load the X Register with an immediate value
-        self.x = self.memory[self.pc]
-        self.pc += 1
+    reminder = {'user_id': ctx.author.id, 'time': reminder_time, 'message': message}
+    reminders.append(reminder)
+    await ctx.send(f"Reminder set for {reminder_time.strftime('%Y-%m-%d %H:%M:%S')}.")
+    check_reminders.start()
 
-    def print_state(self):
-        print(f"PC: {hex(self.pc)} SP: {hex(self.sp)} A: {hex(self.a)} X: {hex(self.x)} Y: {hex(self.y)} Status: {bin(self.status)}")
+# --- Poll Functions ---
+@client.command()
+async def createpoll(ctx, *options):
+    if len(options) < 2:
+        await ctx.send("You need at least two options for a poll.")
+        return
+    
+    poll_id = random.randint(1000, 9999)
+    polls[poll_id] = {"options": options, "votes": {option: 0 for option in options}}
+    
+    poll_message = f"Poll ID: {poll_id}\n"
+    for idx, option in enumerate(options, 1):
+        poll_message += f"{idx}. {option}\n"
+    
+    poll_message += "Use `!vote <poll_id> <option_number>` to vote."
+    await ctx.send(poll_message)
 
+@client.command()
+async def vote(ctx, poll_id: int, option_number: int):
+    if poll_id not in polls:
+        await ctx.send("Poll ID not found.")
+        return
+    
+    poll = polls[poll_id]
+    if option_number < 1 or option_number > len(poll['options']):
+        await ctx.send("Invalid option number.")
+        return
+    
+    selected_option = poll['options'][option_number - 1]
+    poll['votes'][selected_option] += 1
+    
+    await ctx.send(f"You voted for: {selected_option}")
 
-def load_binary(file_path: str):
-    with open(file_path, 'rb') as f:
-        return f.read()
+# --- AI Summary Functionality ---
+@client.command()
+async def summarize(ctx, *, message: str):
+    # This is a placeholder for AI-powered summarization, you can integrate Gemini API here
+    summary = message[:50] + "..." if len(message) > 50 else message
+    await ctx.send(f"Summary: {summary}")
 
-def main():
-    # Create CPU instance
-    cpu = CPU()
-    cpu.reset()
+# --- Music Functions ---
+@client.command()
+async def join(ctx):
+    if ctx.author.voice:
+        channel = ctx.author.voice.channel
+        await channel.connect()
+    else:
+        await ctx.send("You need to join a voice channel first.")
 
-    # Load binary file (replace with actual binary file)
-    program = load_binary('path_to_your_program.bin')
-    cpu.load_program(program)
+@client.command()
+async def leave(ctx):
+    if ctx.voice_client:
+        await ctx.voice_client.disconnect()
+    else:
+        await ctx.send("I'm not connected to any voice channel.")
 
-    # Run the emulator for a few cycles
-    for _ in range(10):  # Run for 10 cycles (adjust as needed)
-        cpu.execute()
-        cpu.print_state()
+@client.command()
+async def play(ctx, url: str):
+    if not ctx.voice_client:
+        await ctx.send("I need to be in a voice channel first!")
+        return
+    
+    # Use youtube-dl to fetch the audio URL
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'postprocessors': [{
+            'key': 'FFmpegAudioConvertor',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+    }
+    
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        url2 = info['formats'][0]['url']
+        voice = ctx.voice_client
+        voice.play(discord.FFmpegPCMAudio(url2))
 
-if __name__ == "__main__":
-    main()
+@client.command()
+async def queue(ctx):
+    if music_queue:
+        await ctx.send("Music Queue:\n" + "\n".join(music_queue))
+    else:
+        await ctx.send("The queue is empty.")
+
+@client.command()
+async def skip(ctx):
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+        await ctx.send("Skipped the current song.")
+    else:
+        await ctx.send("No song is currently playing.")
+
+# --- Welcome Message ---
+@client.event
+async def on_member_join(member):
+    await member.send(f"Welcome to the server, {member.name}! Enjoy your stay!")
+
+# --- Error Handling ---
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user}")
+
+# --- Run the Bot ---
+client.run('YOUR_BOT_TOKEN')
