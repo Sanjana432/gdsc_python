@@ -1,19 +1,24 @@
 import pygame
+import random
 import time
-import pickle
+import sys
 
-class CHIP8:
+# CHIP-8 Emulator Class
+class Chip8Emulator:
     def __init__(self):
-        self.memory = [0] * 4096  # 4K memory
-        self.V = [0] * 16  # 16 general-purpose registers
-        self.I = 0  # Index register
-        self.PC = 0x200  # Program counter starts at 0x200
-        self.SP = 0  # Stack pointer
-        self.stack = [0] * 16  # Stack with 16 levels
-        self.delay_timer = 0
-        self.sound_timer = 0
-        self.keypad = [0] * 16  # Keypad with 16 keys
-        self.display = [[0] * 64 for _ in range(32)]  # 64x32 display
+        # Initialize memory, registers, stack, display, etc.
+        self.memory = [0] * 4096  # 4KB of memory
+        self.v = [0] * 16  # 16 general-purpose registers (V0-VF)
+        self.i = 0  # Index register
+        self.pc = 0x200  # Program counter starts at 0x200
+        self.stack = []  # Stack to store return addresses
+        self.sp = 0  # Stack pointer
+        self.delay_timer = 0  # Delay timer
+        self.sound_timer = 0  # Sound timer
+        self.gfx = [[0] * 64 for _ in range(32)]  # 64x32 pixel display
+        self.keys = [0] * 16  # Keypad state (16 keys)
+
+        # Fontset for CHIP-8
         self.fontset = [
             0xF0, 0x90, 0x90, 0x90, 0xF0,  # 0
             0x20, 0x60, 0x20, 0x20, 0x70,  # 1
@@ -26,81 +31,193 @@ class CHIP8:
             0xF0, 0x90, 0xF0, 0x90, 0xF0,  # 8
             0xF0, 0x90, 0xF0, 0x10, 0xF0,  # 9
             0xF0, 0x90, 0xF0, 0x90, 0x90,  # A
-            0xF0, 0x80, 0xF0, 0x80, 0xF0,  # B
-            0xF0, 0x80, 0xF0, 0x80, 0x80,  # C
-            0xF0, 0x90, 0x90, 0x90, 0xF0,  # D
-            0xF0, 0x80, 0xF0, 0x80, 0xF0,  # E
-            0xF0, 0x80, 0xF0, 0x80, 0x80,  # F
+            0xE0, 0x90, 0xE0, 0x90, 0xE0,  # B
+            0xF0, 0x80, 0x80, 0x80, 0xF0,  # C
+            0xF0, 0x80, 0xF0, 0x80, 0xF0,  # D
+            0xF0, 0x80, 0xF0, 0x80, 0x80   # E
         ]
-        self.load_fonts()
+        self.load_fontset()
 
-    def load_fonts(self):
-        # Load fontset into memory starting at address 0x50
-        for i in range(0, len(self.fontset)):
+        # Initialize Pygame for graphical output
+        pygame.init()
+        self.screen = pygame.display.set_mode((64 * 10, 32 * 10))  # 10x scale for visibility
+        pygame.display.set_caption("CHIP-8 Emulator")
+        self.clock = pygame.time.Clock()
+
+    def load_fontset(self):
+        # Load fontset into memory starting at location 0x50
+        for i in range(len(self.fontset)):
             self.memory[0x50 + i] = self.fontset[i]
 
     def load_program(self, program):
-        # Load the program into memory starting at 0x200
+        # Load a program into memory
         for i in range(len(program)):
             self.memory[0x200 + i] = program[i]
 
-    def handle_input(self):
-        # Handle input using pygame
-        keys = pygame.key.get_pressed()
-        self.keypad = [
-            keys[pygame.K_1], keys[pygame.K_2], keys[pygame.K_3], keys[pygame.K_4],
-            keys[pygame.K_q], keys[pygame.K_w], keys[pygame.K_e], keys[pygame.K_r],
-            keys[pygame.K_a], keys[pygame.K_s], keys[pygame.K_d], keys[pygame.K_f],
-            keys[pygame.K_z], keys[pygame.K_x], keys[pygame.K_c], keys[pygame.K_v]
-        ]
+    def fetch(self):
+        # Fetch the current instruction (2 bytes)
+        opcode = self.memory[self.pc] << 8 | self.memory[self.pc + 1]
+        self.pc += 2
+        return opcode
 
-    def emulate_cycle(self):
-        # Fetch
-        opcode = self.memory[self.PC] << 8 | self.memory[self.PC + 1]
-        self.PC += 2  # Increment the program counter by 2 to get to the next opcode
+    def decode_execute(self, opcode):
+        # Decode and execute the opcode
+        nnn = opcode & 0x0FFF
+        nn = opcode & 0x00FF
+        n = opcode & 0x000F
+        x = (opcode & 0x0F00) >> 8
+        y = (opcode & 0x00F0) >> 4
 
-        # Decode & Execute
-        if opcode == 0x00E0:  # CLS (Clear screen)
-            self.display = [[0] * 64 for _ in range(32)]  # Clear the display
-        elif opcode == 0x00EE:  # RET (Return from subroutine)
-            self.SP -= 1  # Pop the return address from the stack
-            self.PC = self.stack[self.SP]
-        # Additional opcode cases should be added here
+        # Handle opcodes based on their first nibble
+        if opcode == 0x00E0:  # CLS - Clear screen
+            self.gfx = [[0] * 64 for _ in range(32)]
+        elif opcode == 0x00EE:  # RET - Return from subroutine
+            self.pc = self.stack.pop()
+        elif opcode == 0x1NNN:  # JP addr - Jump to address NNN
+            self.pc = nnn
+        elif opcode == 0x2NNN:  # CALL addr - Call subroutine at NNN
+            self.stack.append(self.pc)
+            self.pc = nnn
+        elif opcode == 0x3XNN:  # SE Vx, byte - Skip next instruction if Vx == NN
+            if self.v[x] == nn:
+                self.pc += 2
+        elif opcode == 0x4XNN:  # SNE Vx, byte - Skip next instruction if Vx != NN
+            if self.v[x] != nn:
+                self.pc += 2
+        elif opcode == 0x5XY0:  # SE Vx, Vy - Skip next instruction if Vx == Vy
+            if self.v[x] == self.v[y]:
+                self.pc += 2
+        elif opcode == 0x6XNN:  # LD Vx, byte - Set Vx = NN
+            self.v[x] = nn
+        elif opcode == 0x7XNN:  # ADD Vx, byte - Set Vx = Vx + NN
+            self.v[x] += nn
+        elif opcode == 0x8XY0:  # LD Vx, Vy - Set Vx = Vy
+            self.v[x] = self.v[y]
+        elif opcode == 0x8XY1:  # OR Vx, Vy - Set Vx = Vx OR Vy
+            self.v[x] |= self.v[y]
+        elif opcode == 0x8XY2:  # AND Vx, Vy - Set Vx = Vx AND Vy
+            self.v[x] &= self.v[y]
+        elif opcode == 0x8XY3:  # XOR Vx, Vy - Set Vx = Vx XOR Vy
+            self.v[x] ^= self.v[y]
+        elif opcode == 0x8XY4:  # ADD Vx, Vy - Set Vx = Vx + Vy (carry flag)
+            result = self.v[x] + self.v[y]
+            self.v[0xF] = 1 if result > 255 else 0
+            self.v[x] = result & 0xFF
+        elif opcode == 0x8XY5:  # SUB Vx, Vy - Set Vx = Vx - Vy (borrow flag)
+            self.v[0xF] = 1 if self.v[x] > self.v[y] else 0
+            self.v[x] -= self.v[y]
+        elif opcode == 0x8XY6:  # SHR Vx {, Vy} - Set Vx = Vx SHR 1
+            self.v[0xF] = self.v[x] & 0x1
+            self.v[x] >>= 1
+        elif opcode == 0x8XY7:  # SUBN Vx, Vy - Set Vx = Vy - Vx (borrow flag)
+            self.v[0xF] = 1 if self.v[y] > self.v[x] else 0
+            self.v[x] = self.v[y] - self.v[x]
+        elif opcode == 0x8XYE:  # SHL Vx {, Vy} - Set Vx = Vx SHL 1
+            self.v[0xF] = (self.v[x] >> 7) & 0x1
+            self.v[x] <<= 1
+        elif opcode == 0x9XY0:  # SNE Vx, Vy - Skip next instruction if Vx != Vy
+            if self.v[x] != self.v[y]:
+                self.pc += 2
+        elif opcode == 0xANNN:  # LD I, addr - Set I = NNN
+            self.i = nnn
+        elif opcode == 0xBNNN:  # JP V0, addr - Jump to address NNN + V0
+            self.pc = nnn + self.v[0]
+        elif opcode == 0xCXNN:  # RND Vx, byte - Set Vx = random byte AND NN
+            self.v[x] = random.randint(0, 255) & nn
+        elif opcode == 0xDXYN:  # DRW Vx, Vy, N - Draw sprite at (Vx, Vy)
+            self.v[0xF] = 0
+            for row in range(n):
+                sprite = self.memory[self.i + row]
+                for col in range(8):
+                    if (sprite & (0x80 >> col)) != 0:
+                        if self.gfx[(self.v[y] + row) % 32][(self.v[x] + col) % 64] == 1:
+                            self.v[0xF] = 1  # Pixel collision
+                        self.gfx[(self.v[y] + row) % 32][(self.v[x] + col) % 64] ^= 1
+        elif opcode == 0xEX9E:  # SKP Vx - Skip next instruction if key Vx is pressed
+            if self.keys[self.v[x]] != 0:
+                self.pc += 2
+        elif opcode == 0xEXA1:  # SKNP Vx - Skip next instruction if key Vx is not pressed
+            if self.keys[self.v[x]] == 0:
+                self.pc += 2
+        elif opcode == 0xFX07:  # LD Vx, DT - Set Vx = delay timer
+            self.v[x] = self.delay_timer
+        elif opcode == 0xFX0A:  # LD Vx, K - Wait for key press, store in Vx
+            waiting = True
+            while waiting:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        pygame.quit()
+                        sys.exit()
+                    if event.type == pygame.KEYDOWN:
+                        for i in range(16):
+                            if event.key == pygame.K_1 + i:  # Modify this for your specific keys
+                                self.v[x] = i
+                                waiting = False
+        elif opcode == 0xFX15:  # LD DT, Vx - Set delay timer = Vx
+            self.delay_timer = self.v[x]
+        elif opcode == 0xFX18:  # LD ST, Vx - Set sound timer = Vx
+            self.sound_timer = self.v[x]
+        elif opcode == 0xFX1E:  # ADD I, Vx - Set I = I + Vx
+            self.i += self.v[x]
+        elif opcode == 0xFX29:  # LD F, Vx - Set I = location of sprite for digit Vx
+            self.i = self.v[x] * 5
+        elif opcode == 0xFX33:  # LD B, Vx - Store BCD representation of Vx in memory
+            self.memory[self.i] = self.v[x] // 100
+            self.memory[self.i + 1] = (self.v[x] // 10) % 10
+            self.memory[self.i + 2] = self.v[x] % 10
+        elif opcode == 0xFX55:  # LD [I], V0-Vx - Store registers V0-Vx in memory starting at I
+            for i in range(x + 1):
+                self.memory[self.i + i] = self.v[i]
+        elif opcode == 0xFX65:  # LD V0-Vx, [I] - Read registers V0-Vx from memory starting at I
+            for i in range(x + 1):
+                self.v[i] = self.memory[self.i + i]
+
+    def update_timers(self):
+        # Decrease the timers if they are greater than 0
+        if self.delay_timer > 0:
+            self.delay_timer -= 1
+        if self.sound_timer > 0:
+            self.sound_timer -= 1
 
     def draw_graphics(self):
-        # Create a pygame window
-        screen = pygame.display.set_mode((640, 320))  # 10px per pixel
-        for row in range(32):
-            for col in range(64):
-                if self.display[row][col] == 1:
-                    pygame.draw.rect(screen, (255, 255, 255), (col * 10, row * 10, 10, 10))
-                else:
-                    pygame.draw.rect(screen, (0, 0, 0), (col * 10, row * 10, 10, 10))
-        pygame.display.update()
+        # Render the graphics
+        for y in range(32):
+            for x in range(64):
+                color = (255, 255, 255) if self.gfx[y][x] == 1 else (0, 0, 0)
+                pygame.draw.rect(self.screen, color, (x * 10, y * 10, 10, 10))
+        pygame.display.flip()
 
     def run(self):
-        # Main loop to run the CHIP-8 emulator
-        running = True
-        while running:
-            self.emulate_cycle()  # Fetch, decode, execute cycle
-            self.handle_input()  # Handle user input
+        # Main emulation loop
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_1:
+                        self.keys[1] = 1
+                    # Handle more keys similarly...
 
-            # Update timers
-            if self.delay_timer > 0:
-                self.delay_timer -= 1
-            if self.sound_timer > 0:
-                self.sound_timer -= 1
+                if event.type == pygame.KEYUP:
+                    if event.key == pygame.K_1:
+                        self.keys[1] = 0
+                    # Handle more keys similarly...
 
-            # Draw to screen using pygame
-            self.draw_graphics()  # Render the screen
+            opcode = self.fetch()
+            self.decode_execute(opcode)
+            self.update_timers()
+            self.draw_graphics()
+            self.clock.tick(60)  # Emulate at 60Hz
 
-            # Sleep to control frame rate
-            time.sleep(1 / 60)  # Emulate a 60Hz cycle rate
 
-    def save_state(self, filename):
-        with open(filename, 'wb') as f:
-            pickle.dump(self.__dict__, f)
-
-    def load_state(self, filename):
-        with open(filename, 'rb') as f:
-            self.__dict__ = pickle.load(f)
+# Running the emulator
+if __name__ == "__main__":
+    emulator = Chip8Emulator()
+    
+    # Example: Load a CHIP-8 program (binary file or raw data)
+    # Here, we're loading an empty program for demonstration.
+    program = [0x00] * 1024  # Example program
+    emulator.load_program(program)
+    
+    emulator.run()
